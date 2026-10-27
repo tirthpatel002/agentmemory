@@ -503,26 +503,31 @@ export class SqliteStore implements MemoryStore {
     return hits.slice(0, k);
   }
 
-  async upsertLessonUse(use: LessonUse): Promise<{ inserted: boolean }> {
+  async upsertLessonUse(
+    use: LessonUse,
+  ): Promise<{ inserted: boolean; previousHelped?: boolean | null | undefined }> {
     const existing = this.db
       .prepare(
-        `SELECT run_id, lesson_id
+        `SELECT run_id, lesson_id, helped
         FROM lesson_uses
         WHERE run_id = ? AND lesson_id = ? AND namespace = ? AND user_id = ? AND agent_id = ?`,
       )
-      .get(use.runId, use.lessonId, use.namespace, use.userId, use.agentId) as { run_id: string } | undefined;
+      .get(use.runId, use.lessonId, use.namespace, use.userId, use.agentId) as
+      | { run_id: string; lesson_id: string; helped: number | null }
+      | undefined;
 
     const markedAt = nowIso();
     const helpedInt = use.helped === null ? null : use.helped ? 1 : 0;
 
     if (existing) {
+      const previousHelped = existing.helped === null ? null : existing.helped === 1;
       this.db
         .prepare(
           `UPDATE lesson_uses SET helped = ?, marked_at = ?
           WHERE run_id = ? AND lesson_id = ? AND namespace = ? AND user_id = ? AND agent_id = ?`,
         )
         .run(helpedInt, markedAt, use.runId, use.lessonId, use.namespace, use.userId, use.agentId);
-      return { inserted: false };
+      return { inserted: false, previousHelped };
     }
 
     this.db

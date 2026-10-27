@@ -35,6 +35,6 @@ export interface MemoryStore {
   deleteLesson(scope: Scope, lessonId: string): Promise<boolean>;
   searchLessons(scope: Scope, query: Float32Array, k: number, q?: LessonQuery): Promise<VectorHit[]>;
 
-  upsertLessonUse(use: LessonUse): Promise<{ inserted: boolean }>;
+  upsertLessonUse(use: LessonUse): Promise<{ inserted: boolean; previousHelped?: boolean | null | undefined }>;
   transaction<T>(fn: () => Promise<T>): Promise<T>;
 }
