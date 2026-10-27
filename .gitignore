@@ -1,0 +1,15 @@
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+# secrets: real keys live only in .env (never committed)
+.env
+.env.*
+!.env.example
+# runtime output
+logs/
+results/
+*.db
+*.db-wal
+*.db-shm
+.worktrees/
