@@ -13,3 +13,12 @@ results/
 *.db-wal
 *.db-shm
 .worktrees/
+# agent / tool artifacts (never committed)
+.agy/
+.gemini/
+.antigravity/
+GEMINI.md
+AGENTS.md
+CLAUDE.md
+DONE.md
+.cursor/
