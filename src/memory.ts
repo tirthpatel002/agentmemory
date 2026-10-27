@@ -2,23 +2,38 @@
 import { ulid } from "ulid";
 import type { DeepPartial, MemoryConfig } from "./config.js";
 import { mergeConfig } from "./config.js";
-import { InvalidEventError, NotFoundError, RunClosedError } from "./errors.js";
+import type { Distiller } from "./distiller.js";
+import { LlmDistiller } from "./distiller.js";
+import { cosine } from "./embed.js";
+import {
+  InvalidEventError,
+  InvalidTransitionError,
+  NotFoundError,
+  RunClosedError,
+} from "./errors.js";
+import type { Merger } from "./merger.js";
+import { EmbeddingMerger } from "./merger.js";
 import type { Retriever } from "./retriever.js";
-import { WeightedRetriever } from "./retriever.js";
+import { WeightedRetriever, wordJaccardSimilarity } from "./retriever.js";
 import { SqliteStore } from "./store/sqlite.js";
 import type { LessonQuery, MemoryStore } from "./store/store.js";
 import type {
+  DraftLesson,
   Embedder,
   Event,
   EventInput,
   Extra,
   Lesson,
+  LessonStatus,
   LLM,
   Outcome,
+  Provenance,
   Run,
   RunMeta,
   Scope,
 } from "./types.js";
+import type { LessonValidator } from "./validator.js";
+import { BasicValidator } from "./validator.js";
 
 function nowIso(): string {
   const d = new Date();
@@ -85,7 +100,10 @@ export interface AgentMemoryOptions {
   store?: MemoryStore | undefined;
   llm?: LLM | undefined;
   embedder?: Embedder | undefined;
+  distiller?: Distiller | undefined;
+  merger?: Merger | undefined;
   retriever?: Retriever | undefined;
+  validator?: LessonValidator | undefined;
   config?: DeepPartial<MemoryConfig> | Partial<MemoryConfig> | undefined;
 }
 
@@ -94,7 +112,10 @@ export class AgentMemory {
   public readonly config: MemoryConfig;
   public readonly llm?: LLM | undefined;
   public readonly embedder?: Embedder | undefined;
+  public readonly distiller: Distiller;
+  public readonly merger: Merger;
   public readonly retriever: Retriever;
+  public readonly validator: LessonValidator;
   private initialized = false;
 
   constructor(opts?: AgentMemoryOptions) {
@@ -103,6 +124,15 @@ export class AgentMemory {
     this.embedder = opts?.embedder;
     this.config = mergeConfig(opts?.config);
     this.retriever = opts?.retriever ?? new WeightedRetriever();
+    this.validator =
+      opts?.validator ??
+      new BasicValidator({
+        mergeThreshold: this.config.mergeThreshold,
+        jaccardThreshold: this.config.jaccardThreshold,
+        embedder: this.embedder,
+      });
+    this.merger = opts?.merger ?? new EmbeddingMerger({ embedder: this.embedder });
+    this.distiller = opts?.distiller ?? new LlmDistiller({ llm: this.llm });
   }
 
   async init(): Promise<void> {
@@ -217,8 +247,228 @@ export class AgentMemory {
       meta: updatedMeta,
     });
 
-    // M1 / M2: Learning (Distiller/Merger) returns empty list; built in later checkpoints
-    return [];
+    const fullRun: Run = {
+      ...run,
+      endedAt,
+      outcome,
+      meta: updatedMeta,
+    };
+
+    let drafts: DraftLesson[] = [];
+    try {
+      const activeLessons = await this.store.listLessons(scope, { status: ["active"] });
+      drafts = await this.distiller.distill(fullRun, activeLessons, this.config);
+    } catch (err: unknown) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      const seq = await this.store.nextSeq(scope, runId);
+      const ev: Event = {
+        eventId: `ev_${ulid()}`,
+        runId,
+        namespace: scope.namespace,
+        userId: scope.userId,
+        agentId: scope.agentId,
+        seq,
+        ts: nowIso(),
+        type: "note",
+        error: errMsg,
+        tokens: 0,
+        costUsd: 0,
+        latencyMs: 0,
+        extra: {},
+      };
+      await this.store.insertEvent(ev);
+      return [];
+    }
+
+    if (!drafts || drafts.length === 0) {
+      return [];
+    }
+
+    const toProcess = drafts.slice(0, this.config.maxLessonsPerRun);
+    const results: Lesson[] = [];
+
+    for (const draft of toProcess) {
+      const currentActive = await this.store.listLessons(scope, { status: ["active"] });
+      const valResult = await this.validator.validate(draft, { scope, active: currentActive });
+
+      let draftEmbedding: Float32Array | null = null;
+      if (this.embedder) {
+        const embs = await this.embedder([`${draft.trigger} ${draft.text}`]);
+        draftEmbedding = embs[0] ?? null;
+      }
+
+      if (!valResult.passed) {
+        // Failed validation: stored as rejected
+        const cappedConfidence = Math.min(draft.confidence, this.config.maxInitialConfidence);
+        const rejectedLesson: Lesson = {
+          lessonId: `les_${ulid()}`,
+          namespace: scope.namespace,
+          userId: scope.userId,
+          agentId: scope.agentId,
+          text: draft.text,
+          trigger: draft.trigger,
+          kind: draft.kind,
+          provenance: {
+            createdBy: "distiller",
+            sourceRunIds: [runId],
+            sourceEventIds: draft.sourceEventIds,
+            ...(run.meta?.model ? { distillerModel: run.meta.model } : {}),
+            validation: {
+              validator: this.validator.name,
+              passed: false,
+              reasons: valResult.reasons,
+              at: nowIso(),
+            },
+          },
+          confidence: cappedConfidence,
+          uses: 0,
+          helped: 0,
+          hurt: 0,
+          createdAt: nowIso(),
+          updatedAt: nowIso(),
+          status: "rejected",
+          replacedBy: null,
+          embedding: draftEmbedding,
+          extra: draft.extra ?? {},
+        };
+
+        await this.store.insertLesson(rejectedLesson);
+        results.push(rejectedLesson);
+        continue;
+      }
+
+      // Passed validation: run merger
+      const decision = await this.merger.decide(
+        draft,
+        draftEmbedding,
+        scope,
+        this.store,
+        this.config,
+      );
+
+      if (decision.action === "strengthen") {
+        const existing = await this.store.getLesson(scope, decision.lessonId);
+        if (existing) {
+          const newSourceRunIds = Array.from(new Set([...existing.provenance.sourceRunIds, runId]));
+          const newSourceEventIds = Array.from(
+            new Set([...existing.provenance.sourceEventIds, ...draft.sourceEventIds]),
+          );
+          const newConfidence = Math.min(1, existing.confidence + 0.1);
+          const newText = decision.text ?? existing.text;
+          let newEmbedding = existing.embedding;
+          if (decision.text && this.embedder) {
+            const embs = await this.embedder([`${existing.trigger} ${newText}`]);
+            newEmbedding = embs[0] ?? existing.embedding;
+          }
+
+          const updated = await this.store.updateLesson(scope, existing.lessonId, {
+            confidence: newConfidence,
+            text: newText,
+            embedding: newEmbedding,
+            provenance: {
+              ...existing.provenance,
+              sourceRunIds: newSourceRunIds,
+              sourceEventIds: newSourceEventIds,
+            },
+            updatedAt: nowIso(),
+          });
+          results.push(updated);
+        }
+      } else if (decision.action === "replace") {
+        const initialStatus: LessonStatus = this.config.quarantine.enabled ? "candidate" : "active";
+        const newLessonId = `les_${ulid()}`;
+        const cappedConfidence = Math.min(draft.confidence, this.config.maxInitialConfidence);
+
+        const newLesson: Lesson = {
+          lessonId: newLessonId,
+          namespace: scope.namespace,
+          userId: scope.userId,
+          agentId: scope.agentId,
+          text: draft.text,
+          trigger: draft.trigger,
+          kind: draft.kind,
+          provenance: {
+            createdBy: "distiller",
+            sourceRunIds: [runId],
+            sourceEventIds: draft.sourceEventIds,
+            ...(run.meta?.model ? { distillerModel: run.meta.model } : {}),
+            validation: {
+              validator: this.validator.name,
+              passed: true,
+              reasons: valResult.reasons,
+              at: nowIso(),
+            },
+          },
+          confidence: cappedConfidence,
+          uses: 0,
+          helped: 0,
+          hurt: 0,
+          createdAt: nowIso(),
+          updatedAt: nowIso(),
+          status: initialStatus,
+          replacedBy: null,
+          embedding: draftEmbedding,
+          extra: {
+            ...(draft.extra ?? {}),
+            replacesLessonId: decision.lessonId,
+          },
+        };
+
+        await this.store.insertLesson(newLesson);
+
+        if (!this.config.quarantine.enabled) {
+          await this.store.updateLesson(scope, decision.lessonId, {
+            status: "replaced",
+            replacedBy: newLessonId,
+            updatedAt: nowIso(),
+          });
+        }
+
+        results.push(newLesson);
+      } else {
+        // action === "insert"
+        const initialStatus: LessonStatus = this.config.quarantine.enabled ? "candidate" : "active";
+        const newLessonId = `les_${ulid()}`;
+        const cappedConfidence = Math.min(draft.confidence, this.config.maxInitialConfidence);
+
+        const newLesson: Lesson = {
+          lessonId: newLessonId,
+          namespace: scope.namespace,
+          userId: scope.userId,
+          agentId: scope.agentId,
+          text: draft.text,
+          trigger: draft.trigger,
+          kind: draft.kind,
+          provenance: {
+            createdBy: "distiller",
+            sourceRunIds: [runId],
+            sourceEventIds: draft.sourceEventIds,
+            ...(run.meta?.model ? { distillerModel: run.meta.model } : {}),
+            validation: {
+              validator: this.validator.name,
+              passed: true,
+              reasons: valResult.reasons,
+              at: nowIso(),
+            },
+          },
+          confidence: cappedConfidence,
+          uses: 0,
+          helped: 0,
+          hurt: 0,
+          createdAt: nowIso(),
+          updatedAt: nowIso(),
+          status: initialStatus,
+          replacedBy: null,
+          embedding: draftEmbedding,
+          extra: draft.extra ?? {},
+        };
+
+        await this.store.insertLesson(newLesson);
+        results.push(newLesson);
+      }
+    }
+
+    return results;
   }
 
   async recall(scope: Scope, task: string, k = 5): Promise<Lesson[]> {
@@ -234,7 +484,58 @@ export class AgentMemory {
       }
     }
 
-    return this.retriever.rank(scope, task, taskEmbedding, k, this.store, this.config);
+    const activeLessons = await this.retriever.rank(
+      scope,
+      task,
+      taskEmbedding,
+      k,
+      this.store,
+      this.config,
+    );
+
+    const trialSlots = this.config.quarantine.trialSlots;
+    if (trialSlots <= 0) {
+      return activeLessons;
+    }
+
+    const candidateLessons = await this.store.listLessons(scope, { status: ["candidate"] });
+    const validatedCandidates = candidateLessons.filter(
+      (c) => c.provenance.validation === undefined || c.provenance.validation.passed !== false,
+    );
+
+    if (validatedCandidates.length === 0) {
+      return activeLessons;
+    }
+
+    interface ScoredCandidate {
+      lesson: Lesson;
+      sim: number;
+    }
+    const scored: ScoredCandidate[] = [];
+
+    for (const c of validatedCandidates) {
+      let sim = 0;
+      if (taskEmbedding !== null && c.embedding !== null) {
+        sim = Math.max(0, Math.min(1, cosine(taskEmbedding, c.embedding)));
+      } else {
+        sim = Math.max(0, Math.min(1, wordJaccardSimilarity(task, `${c.trigger} ${c.text}`)));
+      }
+      if (sim >= this.config.minSimilarity) {
+        scored.push({ lesson: c, sim });
+      }
+    }
+
+    scored.sort((a, b) => b.sim - a.sim);
+    const trialLessons = scored.slice(0, trialSlots).map((s) => ({
+      ...s.lesson,
+      score: s.sim,
+      extra: {
+        ...s.lesson.extra,
+        trial: true,
+      },
+    }));
+
+    return [...activeLessons, ...trialLessons];
   }
 
   asPrompt(lessons: Lesson[]): string {
@@ -305,6 +606,22 @@ export class AgentMemory {
           hurt: Math.max(0, hurtCount),
         };
 
+        // Promotion rule: candidate -> active after promoteAfterHelpedUses helped uses unless requireApproval
+        if (
+          lesson.status === "candidate" &&
+          !this.config.quarantine.requireApproval &&
+          helpedCount >= this.config.quarantine.promoteAfterHelpedUses
+        ) {
+          patch.status = "active";
+          if (typeof lesson.extra?.replacesLessonId === "string") {
+            await this.store.updateLesson(scope, lesson.extra.replacesLessonId, {
+              status: "replaced",
+              replacedBy: lesson.lessonId,
+              updatedAt: nowIso(),
+            });
+          }
+        }
+
         // Retirement rule: uses >= retire.minUses and hurt > helped -> status replaced (replaced_by NULL)
         if (
           lesson.status === "active" &&
@@ -345,8 +662,120 @@ export class AgentMemory {
       throw new NotFoundError(`Lesson ${lessonId} not found in scope`);
     }
 
+    let embedding = existing.embedding;
+    if (this.embedder) {
+      const embeddings = await this.embedder([`${existing.trigger} ${text}`]);
+      const first = embeddings[0];
+      if (first) {
+        embedding = first;
+      }
+    }
+
+    const draft: DraftLesson = {
+      text,
+      trigger: existing.trigger,
+      kind: existing.kind,
+      sourceEventIds: existing.provenance.sourceEventIds,
+      confidence: existing.confidence,
+      updatesLessonId: null,
+    };
+
+    const active = (await this.store.listLessons(scope, { status: ["active"] })).filter(
+      (l) => l.lessonId !== lessonId,
+    );
+    const valResult = await this.validator.validate(draft, { scope, active });
+
     const updatedAt = nowIso();
-    return this.store.updateLesson(scope, lessonId, { text, updatedAt });
+    let status = existing.status;
+    const provenance: Provenance = {
+      ...existing.provenance,
+      validation: {
+        validator: this.validator.name,
+        passed: valResult.passed,
+        reasons: valResult.reasons,
+        at: updatedAt,
+      },
+    };
+
+    if (!valResult.passed) {
+      status = "candidate";
+    }
+
+    return this.store.updateLesson(scope, lessonId, {
+      text,
+      embedding,
+      status,
+      provenance,
+      updatedAt,
+    });
+  }
+
+  async approveLesson(scope: Scope, lessonId: string, by: string, note?: string): Promise<Lesson> {
+    validateScope(scope);
+    await this.ensureInit();
+
+    const lesson = await this.store.getLesson(scope, lessonId);
+    if (!lesson) {
+      throw new NotFoundError(`Lesson ${lessonId} not found in scope`);
+    }
+
+    if (lesson.status !== "candidate" && lesson.status !== "rejected") {
+      throw new InvalidTransitionError(
+        `Cannot approve lesson ${lessonId} with status '${lesson.status}'`,
+      );
+    }
+
+    const updatedAt = nowIso();
+    const provenance: Provenance = {
+      ...lesson.provenance,
+      reviewedBy: by,
+      reviewedAt: updatedAt,
+      ...(note !== undefined ? { reviewNote: note } : {}),
+    };
+
+    if (typeof lesson.extra?.replacesLessonId === "string") {
+      await this.store.updateLesson(scope, lesson.extra.replacesLessonId, {
+        status: "replaced",
+        replacedBy: lesson.lessonId,
+        updatedAt,
+      });
+    }
+
+    return this.store.updateLesson(scope, lessonId, {
+      status: "active",
+      provenance,
+      updatedAt,
+    });
+  }
+
+  async rejectLesson(scope: Scope, lessonId: string, by: string, note?: string): Promise<Lesson> {
+    validateScope(scope);
+    await this.ensureInit();
+
+    const lesson = await this.store.getLesson(scope, lessonId);
+    if (!lesson) {
+      throw new NotFoundError(`Lesson ${lessonId} not found in scope`);
+    }
+
+    if (lesson.status !== "candidate" && lesson.status !== "active") {
+      throw new InvalidTransitionError(
+        `Cannot reject lesson ${lessonId} with status '${lesson.status}'`,
+      );
+    }
+
+    const updatedAt = nowIso();
+    const provenance: Provenance = {
+      ...lesson.provenance,
+      reviewedBy: by,
+      reviewedAt: updatedAt,
+      ...(note !== undefined ? { reviewNote: note } : {}),
+    };
+
+    return this.store.updateLesson(scope, lessonId, {
+      status: "rejected",
+      provenance,
+      updatedAt,
+    });
   }
 
   async forget(scope: Scope, lessonId: string): Promise<void> {
