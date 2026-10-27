@@ -1,8 +1,10 @@
 // src/memory.ts
 import { ulid } from "ulid";
-import type { MemoryConfig } from "./config.js";
-import { DEFAULT_MEMORY_CONFIG } from "./config.js";
+import type { DeepPartial, MemoryConfig } from "./config.js";
+import { mergeConfig } from "./config.js";
 import { InvalidEventError, NotFoundError, RunClosedError } from "./errors.js";
+import type { Retriever } from "./retriever.js";
+import { WeightedRetriever } from "./retriever.js";
 import { SqliteStore } from "./store/sqlite.js";
 import type { LessonQuery, MemoryStore } from "./store/store.js";
 import type {
@@ -60,11 +62,31 @@ function cutPayload(val: unknown, maxBytes = 8192): unknown {
   return str;
 }
 
+export function asPrompt(lessons: Lesson[]): string {
+  if (!lessons || lessons.length === 0) {
+    return "";
+  }
+
+  const header = "Lessons from earlier runs (follow unless the task says otherwise):";
+  const items = lessons.map((lesson, idx) => {
+    const num = idx + 1;
+    const isTrial =
+      lesson.status === "candidate" ||
+      Boolean((lesson as unknown as { trial?: boolean }).trial) ||
+      Boolean(lesson.extra?.trial);
+    const tag = isTrial ? `[${lesson.kind}, trial]` : `[${lesson.kind}]`;
+    return `${num}. ${tag} ${lesson.text}`;
+  });
+
+  return [header, ...items].join("\n");
+}
+
 export interface AgentMemoryOptions {
   store?: MemoryStore | undefined;
   llm?: LLM | undefined;
   embedder?: Embedder | undefined;
-  config?: Partial<MemoryConfig> | undefined;
+  retriever?: Retriever | undefined;
+  config?: DeepPartial<MemoryConfig> | Partial<MemoryConfig> | undefined;
 }
 
 export class AgentMemory {
@@ -72,28 +94,15 @@ export class AgentMemory {
   public readonly config: MemoryConfig;
   public readonly llm?: LLM | undefined;
   public readonly embedder?: Embedder | undefined;
+  public readonly retriever: Retriever;
   private initialized = false;
 
   constructor(opts?: AgentMemoryOptions) {
     this.store = opts?.store ?? new SqliteStore({ path: "memory.db" });
     this.llm = opts?.llm;
     this.embedder = opts?.embedder;
-    this.config = {
-      ...DEFAULT_MEMORY_CONFIG,
-      ...opts?.config,
-      weights: {
-        ...DEFAULT_MEMORY_CONFIG.weights,
-        ...opts?.config?.weights,
-      },
-      retire: {
-        ...DEFAULT_MEMORY_CONFIG.retire,
-        ...opts?.config?.retire,
-      },
-      quarantine: {
-        ...DEFAULT_MEMORY_CONFIG.quarantine,
-        ...opts?.config?.quarantine,
-      },
-    };
+    this.config = mergeConfig(opts?.config);
+    this.retriever = opts?.retriever ?? new WeightedRetriever();
   }
 
   async init(): Promise<void> {
@@ -208,8 +217,108 @@ export class AgentMemory {
       meta: updatedMeta,
     });
 
-    // M1: Learning not implemented yet, returns empty list
+    // M1 / M2: Learning (Distiller/Merger) returns empty list; built in later checkpoints
     return [];
+  }
+
+  async recall(scope: Scope, task: string, k = 5): Promise<Lesson[]> {
+    validateScope(scope);
+    await this.ensureInit();
+
+    let taskEmbedding: Float32Array | null = null;
+    if (this.embedder) {
+      const embeddings = await this.embedder([task]);
+      const first = embeddings[0];
+      if (first) {
+        taskEmbedding = first;
+      }
+    }
+
+    return this.retriever.rank(scope, task, taskEmbedding, k, this.store, this.config);
+  }
+
+  asPrompt(lessons: Lesson[]): string {
+    return asPrompt(lessons);
+  }
+
+  async markUsed(
+    scope: Scope,
+    runId: string,
+    lessonIds: string[] | string,
+    helped?: boolean | null | "helped" | "hurt" | "neutral",
+  ): Promise<void> {
+    validateScope(scope);
+    await this.ensureInit();
+
+    const run = await this.store.getRun(scope, runId);
+    if (!run) {
+      throw new NotFoundError(`Run ${runId} not found in scope`);
+    }
+
+    let helpedBool: boolean | null = null;
+    if (typeof helped === "boolean") {
+      helpedBool = helped;
+    } else if (helped === "helped") {
+      helpedBool = true;
+    } else if (helped === "hurt") {
+      helpedBool = false;
+    } else {
+      helpedBool = null;
+    }
+
+    const ids = Array.isArray(lessonIds) ? lessonIds : [lessonIds];
+
+    await this.store.transaction(async () => {
+      for (const lessonId of ids) {
+        const lesson = await this.store.getLesson(scope, lessonId);
+        if (!lesson) {
+          throw new NotFoundError(`Lesson ${lessonId} not found in scope`);
+        }
+
+        const { inserted, previousHelped } = await this.store.upsertLessonUse({
+          runId,
+          lessonId,
+          namespace: scope.namespace,
+          userId: scope.userId,
+          agentId: scope.agentId,
+          helped: helpedBool,
+        });
+
+        let uses = lesson.uses;
+        let helpedCount = lesson.helped;
+        let hurtCount = lesson.hurt;
+
+        if (inserted) {
+          uses += 1;
+          if (helpedBool === true) helpedCount += 1;
+          if (helpedBool === false) hurtCount += 1;
+        } else if (previousHelped !== undefined && previousHelped !== helpedBool) {
+          if (previousHelped === true) helpedCount -= 1;
+          if (previousHelped === false) hurtCount -= 1;
+          if (helpedBool === true) helpedCount += 1;
+          if (helpedBool === false) hurtCount += 1;
+        }
+
+        const patch: Partial<Lesson> = {
+          uses,
+          helped: Math.max(0, helpedCount),
+          hurt: Math.max(0, hurtCount),
+        };
+
+        // Retirement rule: uses >= retire.minUses and hurt > helped -> status replaced (replaced_by NULL)
+        if (
+          lesson.status === "active" &&
+          this.config.retire.rule === "hurtGtHelped" &&
+          uses >= this.config.retire.minUses &&
+          hurtCount > helpedCount
+        ) {
+          patch.status = "replaced";
+          patch.replacedBy = lesson.replacedBy ?? null;
+        }
+
+        await this.store.updateLesson(scope, lessonId, patch);
+      }
+    });
   }
 
   async listLessons(scope: Scope, q?: LessonQuery): Promise<Lesson[]> {
