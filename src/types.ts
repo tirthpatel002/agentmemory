@@ -95,6 +95,16 @@ export interface LessonUse extends Scope {
   helped: boolean | null; // null = not judged
 }
 
+export interface DraftLesson {
+  text: string;
+  trigger: string;
+  kind: LessonKind;
+  sourceEventIds: string[];
+  confidence: number;
+  updatesLessonId?: string | null | undefined;
+  extra?: Extra | undefined;
+}
+
 // Injected functions; defaults wrap @hackkit/connector chat() and embed()
 export type LLM = (messages: { role: string; content: string }[], opts: { json: boolean }) => Promise<string>;
 export type Embedder = (texts: string[]) => Promise<Float32Array[]>;
