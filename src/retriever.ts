@@ -1,5 +1,6 @@
 // src/retriever.ts
 import type { MemoryConfig } from "./config.js";
+import { bm25Similarities } from "./lexical.js";
 import type { MemoryStore } from "./store/store.js";
 import type { Lesson, Scope } from "./types.js";
 
@@ -112,18 +113,18 @@ export class WeightedRetriever implements Retriever {
         candidates.push({ lesson: hit.lesson, score, similarity });
       }
     } else {
-      // Fallback without embedder: text-overlap Jaccard similarity on trigger + text
-      const lessons = await store.listLessons(scope, { status: ["active"] });
-      for (const lesson of lessons) {
-        if (lesson.status !== "active") {
-          continue;
-        }
+      // Fallback without embedder: normalised BM25 over trigger + text of the active lessons in scope
+      const lessons = (await store.listLessons(scope, { status: ["active"] })).filter(
+        (l) => l.status === "active",
+      );
+      const sims = bm25Similarities(
+        task,
+        lessons.map((l) => `${l.trigger} ${l.text}`),
+      );
+      for (const [i, lesson] of lessons.entries()) {
+        const similarity = sims[i] ?? 0;
 
-        const combinedText = `${lesson.trigger} ${lesson.text}`;
-        const rawSim = wordJaccardSimilarity(task, combinedText);
-        const similarity = Math.max(0, Math.min(1, rawSim));
-
-        if (similarity < cfg.minSimilarity) {
+        if (similarity < cfg.minLexicalSimilarity) {
           continue;
         }
 

@@ -14,7 +14,8 @@ import {
 import type { Merger } from "./merger.js";
 import { EmbeddingMerger } from "./merger.js";
 import type { Retriever } from "./retriever.js";
-import { WeightedRetriever, wordJaccardSimilarity } from "./retriever.js";
+import { WeightedRetriever } from "./retriever.js";
+import { bm25Similarities } from "./lexical.js";
 import { SqliteStore } from "./store/sqlite.js";
 import type { LessonQuery, MemoryStore } from "./store/store.js";
 import type {
@@ -105,6 +106,27 @@ export interface AgentMemoryOptions {
   retriever?: Retriever | undefined;
   validator?: LessonValidator | undefined;
   config?: DeepPartial<MemoryConfig> | Partial<MemoryConfig> | undefined;
+  /**
+   * Called when a model-backed step fails inside endRun (the run is still closed and
+   * endRun does not throw). Default: console.warn.
+   */
+  onError?: ((err: EndRunError) => void) | undefined;
+}
+
+export interface EndRunError {
+  stage: "distill";
+  runId: string;
+  name: string;
+  message: string;
+  error: unknown;
+}
+
+/** Lessons written by endRun; `errors` (non-enumerable) lists model failures that were absorbed. */
+export type EndRunResult = Lesson[] & { readonly errors: EndRunError[] };
+
+function endRunResult(lessons: Lesson[], errors: EndRunError[] = []): EndRunResult {
+  Object.defineProperty(lessons, "errors", { value: errors, enumerable: false });
+  return lessons as EndRunResult;
 }
 
 export class AgentMemory {
@@ -117,6 +139,7 @@ export class AgentMemory {
   public readonly retriever: Retriever;
   public readonly validator: LessonValidator;
   private initialized = false;
+  private readonly onError: (err: EndRunError) => void;
 
   constructor(opts?: AgentMemoryOptions) {
     this.store = opts?.store ?? new SqliteStore({ path: "memory.db" });
@@ -133,6 +156,9 @@ export class AgentMemory {
       });
     this.merger = opts?.merger ?? new EmbeddingMerger({ embedder: this.embedder });
     this.distiller = opts?.distiller ?? new LlmDistiller({ llm: this.llm });
+    this.onError =
+      opts?.onError ??
+      ((e) => console.warn(`agentmemory: endRun ${e.stage} failed for ${e.runId}: ${e.name}: ${e.message}`));
   }
 
   async init(): Promise<void> {
@@ -213,7 +239,7 @@ export class AgentMemory {
     return eventId;
   }
 
-  async endRun(scope: Scope, runId: string, outcome: Outcome): Promise<Lesson[]> {
+  async endRun(scope: Scope, runId: string, outcome: Outcome): Promise<EndRunResult> {
     validateScope(scope);
     await this.ensureInit();
 
@@ -260,6 +286,7 @@ export class AgentMemory {
       drafts = await this.distiller.distill(fullRun, activeLessons, this.config);
     } catch (err: unknown) {
       const errMsg = err instanceof Error ? err.message : String(err);
+      const errName = err instanceof Error ? err.name : "Error";
       const seq = await this.store.nextSeq(scope, runId);
       const ev: Event = {
         eventId: `ev_${ulid()}`,
@@ -274,14 +301,20 @@ export class AgentMemory {
         tokens: 0,
         costUsd: 0,
         latencyMs: 0,
-        extra: {},
+        extra: { stage: "distill", errorName: errName },
       };
       await this.store.insertEvent(ev);
-      return [];
+      const info: EndRunError = { stage: "distill", runId, name: errName, message: errMsg, error: err };
+      try {
+        this.onError(info);
+      } catch {
+        // a throwing hook must not break the caller's agent
+      }
+      return endRunResult([], [info]);
     }
 
     if (!drafts || drafts.length === 0) {
-      return [];
+      return endRunResult([]);
     }
 
     const toProcess = drafts.slice(0, this.config.maxLessonsPerRun);
@@ -468,7 +501,7 @@ export class AgentMemory {
       }
     }
 
-    return results;
+    return endRunResult(results);
   }
 
   async recall(scope: Scope, task: string, k = 5): Promise<Lesson[]> {
@@ -513,14 +546,20 @@ export class AgentMemory {
     }
     const scored: ScoredCandidate[] = [];
 
-    for (const c of validatedCandidates) {
+    const lexical = bm25Similarities(
+      task,
+      validatedCandidates.map((c) => `${c.trigger} ${c.text}`),
+    );
+    for (const [i, c] of validatedCandidates.entries()) {
       let sim = 0;
+      let threshold = this.config.minSimilarity;
       if (taskEmbedding !== null && c.embedding !== null) {
         sim = Math.max(0, Math.min(1, cosine(taskEmbedding, c.embedding)));
       } else {
-        sim = Math.max(0, Math.min(1, wordJaccardSimilarity(task, `${c.trigger} ${c.text}`)));
+        sim = lexical[i] ?? 0;
+        threshold = this.config.minLexicalSimilarity;
       }
-      if (sim >= this.config.minSimilarity) {
+      if (sim >= threshold) {
         scored.push({ lesson: c, sim });
       }
     }

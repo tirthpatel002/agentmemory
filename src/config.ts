@@ -4,7 +4,8 @@ export interface MemoryConfig {
   maxLessonsPerRun: number; // 3
   weights: { similarity: number; helpfulness: number; recency: number }; // 0.6 / 0.3 / 0.1
   recencyHalfLifeDays: number; // 14
-  minSimilarity: number; // 0.3 : below this a lesson is never recalled
+  minSimilarity: number; // 0.3 : below this a lesson is never recalled (embedding cosine)
+  minLexicalSimilarity: number; // 0.25 : same cut-off for the BM25 score used when there is no embedder
   mergeThreshold: number; // 0.88 cosine
   jaccardThreshold: number; // 0.6 when no embedder
   maxInitialConfidence: number; // 0.7
@@ -22,6 +23,7 @@ export const DEFAULT_MEMORY_CONFIG: MemoryConfig = {
   weights: { similarity: 0.6, helpfulness: 0.3, recency: 0.1 },
   recencyHalfLifeDays: 14,
   minSimilarity: 0.3,
+  minLexicalSimilarity: 0.25,
   mergeThreshold: 0.88,
   jaccardThreshold: 0.6,
   maxInitialConfidence: 0.7,
@@ -57,6 +59,7 @@ export function mergeConfig(partial?: DeepPartial<MemoryConfig> | Partial<Memory
     },
     recencyHalfLifeDays: partial.recencyHalfLifeDays ?? DEFAULT_MEMORY_CONFIG.recencyHalfLifeDays,
     minSimilarity: partial.minSimilarity ?? DEFAULT_MEMORY_CONFIG.minSimilarity,
+    minLexicalSimilarity: partial.minLexicalSimilarity ?? DEFAULT_MEMORY_CONFIG.minLexicalSimilarity,
     mergeThreshold: partial.mergeThreshold ?? DEFAULT_MEMORY_CONFIG.mergeThreshold,
     jaccardThreshold: partial.jaccardThreshold ?? DEFAULT_MEMORY_CONFIG.jaccardThreshold,
     maxInitialConfidence: partial.maxInitialConfidence ?? DEFAULT_MEMORY_CONFIG.maxInitialConfidence,

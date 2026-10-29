@@ -24,8 +24,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run",
-    "eval": "tsx src/eval.ts"
+    "test": "vitest run"
   },
   "pnpm": {
     "onlyBuiltDependencies": [

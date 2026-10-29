@@ -19,3 +19,6 @@ export class InvalidEventError extends MemoryError {}
 
 /** Invalid state transition (e.g. approving a deleted lesson) */
 export class InvalidTransitionError extends MemoryError {}
+
+/** The distiller could not turn the model reply into lessons (unparseable JSON or no schema-valid lesson). */
+export class DistillError extends MemoryError {}
