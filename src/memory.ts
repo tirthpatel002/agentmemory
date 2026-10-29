@@ -97,6 +97,20 @@ export function asPrompt(lessons: Lesson[]): string {
   return [header, ...items].join("\n");
 }
 
+export interface RememberInput {
+  text: string;
+  trigger?: string | undefined;
+  kind?: string | undefined;
+  /** Lesson id(s) this memory replaces; they become status `replaced`. */
+  supersedes?: string | string[] | null | undefined;
+  confidence?: number | undefined;
+  createdAt?: string | undefined;
+  lessonId?: string | undefined;
+  embedding?: Float32Array | null | undefined;
+  provenance?: Provenance | undefined;
+  extra?: Extra | undefined;
+}
+
 export interface AgentMemoryOptions {
   store?: MemoryStore | undefined;
   llm?: LLM | undefined;
@@ -526,9 +540,10 @@ export class AgentMemory {
       this.config,
     );
 
+    const activeOnly = activeLessons.filter((l) => l.status === "active");
     const trialSlots = this.config.quarantine.trialSlots;
     if (trialSlots <= 0) {
-      return activeLessons;
+      return activeOnly;
     }
 
     const candidateLessons = await this.store.listLessons(scope, { status: ["candidate"] });
@@ -537,7 +552,7 @@ export class AgentMemory {
     );
 
     if (validatedCandidates.length === 0) {
-      return activeLessons;
+      return activeOnly;
     }
 
     interface ScoredCandidate {
@@ -574,7 +589,7 @@ export class AgentMemory {
       },
     }));
 
-    return [...activeLessons, ...trialLessons];
+    return [...activeOnly, ...trialLessons];
   }
 
   asPrompt(lessons: Lesson[]): string {
@@ -839,6 +854,112 @@ export class AgentMemory {
     }
 
     return run;
+  }
+
+  /**
+   * Store a memory directly (no run/distiller). If `supersedes` names older lessons, they are
+   * marked `replaced` (replacedBy = new id) in the same transaction, so recall only sees the newest.
+   */
+  async remember(scope: Scope, input: RememberInput): Promise<Lesson> {
+    validateScope(scope);
+    await this.ensureInit();
+    if (typeof input?.text !== "string" || input.text.trim() === "") {
+      throw new InvalidEventError("remember() needs non-empty text");
+    }
+    const olds = input.supersedes === undefined || input.supersedes === null
+      ? [] : Array.isArray(input.supersedes) ? input.supersedes : [input.supersedes];
+    const trigger = input.trigger ?? "";
+    let embedding: Float32Array | null = input.embedding ?? null;
+    if (embedding === null && this.embedder) {
+      embedding = (await this.embedder([`${trigger} ${input.text}`.trim()]))[0] ?? null;
+    }
+    const at = input.createdAt ?? nowIso();
+    const lesson: Lesson = {
+      ...scope,
+      lessonId: input.lessonId ?? ulid(),
+      text: input.text,
+      trigger,
+      kind: input.kind ?? "prefer",
+      provenance: input.provenance ?? { createdBy: "manual", sourceRunIds: [], sourceEventIds: [] },
+      confidence: input.confidence ?? 0.7,
+      uses: 0,
+      helped: 0,
+      hurt: 0,
+      createdAt: at,
+      updatedAt: at,
+      status: "active",
+      replacedBy: null,
+      embedding,
+      extra: { ...(input.extra ?? {}), ...(olds.length ? { supersedes: olds } : {}) },
+    };
+    await this.store.transaction(async () => {
+      for (const id of olds) await this.checkSupersedable(scope, id, lesson.lessonId);
+      await this.store.insertLesson(lesson);
+      for (const id of olds) {
+        await this.store.updateLesson(scope, id, { status: "replaced", replacedBy: lesson.lessonId, updatedAt: nowIso() });
+      }
+    });
+    return lesson;
+  }
+
+  /** Mark an existing lesson as replaced by another existing lesson (newest wins in recall). */
+  async supersede(scope: Scope, oldLessonId: string, newLessonId: string): Promise<Lesson> {
+    validateScope(scope);
+    await this.ensureInit();
+    return this.store.transaction(async () => {
+      const newer = await this.store.getLesson(scope, newLessonId);
+      if (!newer) throw new NotFoundError(`Lesson ${newLessonId} not found in scope`);
+      if (newer.status !== "active" && newer.status !== "candidate") {
+        throw new InvalidTransitionError(`Lesson ${newLessonId} is '${newer.status}' and cannot supersede`);
+      }
+      await this.checkSupersedable(scope, oldLessonId, newLessonId);
+      // both are heads of their chains (active/candidate), so no cycle is possible
+      return this.store.updateLesson(scope, oldLessonId, { status: "replaced", replacedBy: newLessonId, updatedAt: nowIso() });
+    });
+  }
+
+  /** Follow replacedBy links to the newest version of a lesson. */
+  async current(scope: Scope, lessonId: string): Promise<Lesson> {
+    validateScope(scope);
+    await this.ensureInit();
+    let l = await this.store.getLesson(scope, lessonId);
+    if (!l) throw new NotFoundError(`Lesson ${lessonId} not found in scope`);
+    const seen = new Set<string>();
+    while (l.replacedBy && !seen.has(l.lessonId)) {
+      seen.add(l.lessonId);
+      const next: Lesson | null = await this.store.getLesson(scope, l.replacedBy);
+      if (!next) break;
+      l = next;
+    }
+    return l;
+  }
+
+  /** Version chain containing lessonId, oldest first, newest last. */
+  async history(scope: Scope, lessonId: string): Promise<Lesson[]> {
+    validateScope(scope);
+    await this.ensureInit();
+    const head = await this.current(scope, lessonId);
+    const replaced = await this.store.listLessons(scope, { status: ["replaced"] });
+    const byNext = new Map<string, Lesson>();
+    for (const l of replaced) if (l.replacedBy) byNext.set(l.replacedBy, l);
+    const out: Lesson[] = [head];
+    const seen = new Set([head.lessonId]);
+    let cur = byNext.get(head.lessonId);
+    while (cur && !seen.has(cur.lessonId)) {
+      out.unshift(cur);
+      seen.add(cur.lessonId);
+      cur = byNext.get(cur.lessonId);
+    }
+    return out;
+  }
+
+  private async checkSupersedable(scope: Scope, oldId: string, newId: string): Promise<void> {
+    if (oldId === newId) throw new InvalidTransitionError("A lesson cannot supersede itself");
+    const old = await this.store.getLesson(scope, oldId);
+    if (!old) throw new NotFoundError(`Lesson ${oldId} not found in scope`);
+    if (old.status !== "active" && old.status !== "candidate") {
+      throw new InvalidTransitionError(`Lesson ${oldId} is '${old.status}' and cannot be superseded`);
+    }
   }
 
   async close(): Promise<void> {
