@@ -12,3 +12,4 @@ export * from "./store/store.js";
 export * from "./store/schema.js";
 export * from "./store/sqlite.js";
 export * from "./memory.js";
+export * from "./embedders/openaiCompat.js";
